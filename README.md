@@ -1,0 +1,1 @@
+# visual-secret-sharing-app
