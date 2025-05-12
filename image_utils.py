@@ -13,11 +13,8 @@ def create_preview_image(share_data, original_shape):
         raise ValueError("Expected share data with 3 channels")
     
     # Create an empty image with the same shape as the original
-    img_array = np.zeros(original_shape, dtype=np.uint8)
-    
-    # We'll create a separate array to mark which pixels had values of 256
-    # This helps us distinguish between original 0 and values that were 256
-    marker_array = np.zeros((original_shape[0], original_shape[1], 3), dtype=np.uint8)
+    # Using RGBA where alpha channel stores our marker for 256 values
+    img_array = np.zeros((original_shape[0], original_shape[1], 4), dtype=np.uint8)
     
     # Fill the image with share data
     for y in range(original_shape[0]):
@@ -26,54 +23,25 @@ def create_preview_image(share_data, original_shape):
             if pixel_idx < len(share_data):
                 r, g, b = share_data[pixel_idx]
                 
-                # Check for values that are exactly 256 (would become 0 in the PNG)
-                # We'll use a special encoding: 255 in the main image and 1 in the marker
-                r_is_256 = 1 if r == 256 else 0
-                g_is_256 = 1 if g == 256 else 0
-                b_is_256 = 1 if b == 256 else 0
+                # Store marker bits in alpha channel (default 255 - fully opaque)
+                # We only need 1 bit per channel to mark if value is 256
+                alpha = 255
                 
-                # Store markers for any 256 values
-                marker_array[y, x] = [r_is_256, g_is_256, b_is_256]
+                # Convert values for storage in PNG
+                # If value is 256, store as 0 but mark it in the alpha channel
+                r_mod = r % 256
+                g_mod = g % 256
+                b_mod = b % 256
                 
-                # Convert 256 to 255 in the main image
-                r_val = 255 if r == 256 else r % 256
-                g_val = 255 if g == 256 else g % 256
-                b_val = 255 if b == 256 else b % 256
+                # Mark if any channel had value 256 using specific bits in alpha
+                if r == 256: alpha -= 1  # Subtract 1 for R channel
+                if g == 256: alpha -= 2  # Subtract 2 for G channel
+                if b == 256: alpha -= 4  # Subtract 4 for B channel
                 
-                img_array[y, x] = [r_val, g_val, b_val]
-    
-    # Combine the arrays: we'll use the alpha channel for our marker
-    # Convert RGB to RGBA
-    rgba_array = np.zeros((original_shape[0], original_shape[1], 4), dtype=np.uint8)
-    rgba_array[:, :, :3] = img_array  # Copy RGB channels
-    
-    # Use the alpha channel as our marker: 254 means normal, 255 means there was a 256
-    # This gives us a way to detect which pixels were originally 256
-    rgba_array[:, :, 3] = 254  # Default alpha
-    
-    # Set special alpha values for pixels that had 256 in any channel
-    for y in range(original_shape[0]):
-        for x in range(original_shape[1]):
-            if np.any(marker_array[y, x] > 0):
-                # Encode the marker in the alpha channel
-                # We use 255, 253, 252 to indicate which channel(s) had 256
-                if marker_array[y, x, 0] == 1 and marker_array[y, x, 1] == 0 and marker_array[y, x, 2] == 0:
-                    rgba_array[y, x, 3] = 255  # R only
-                elif marker_array[y, x, 0] == 0 and marker_array[y, x, 1] == 1 and marker_array[y, x, 2] == 0:
-                    rgba_array[y, x, 3] = 253  # G only
-                elif marker_array[y, x, 0] == 0 and marker_array[y, x, 1] == 0 and marker_array[y, x, 2] == 1:
-                    rgba_array[y, x, 3] = 252  # B only
-                elif marker_array[y, x, 0] == 1 and marker_array[y, x, 1] == 1 and marker_array[y, x, 0] == 0:
-                    rgba_array[y, x, 3] = 251  # R and G
-                elif marker_array[y, x, 0] == 1 and marker_array[y, x, 1] == 0 and marker_array[y, x, 2] == 1:
-                    rgba_array[y, x, 3] = 250  # R and B
-                elif marker_array[y, x, 0] == 0 and marker_array[y, x, 1] == 1 and marker_array[y, x, 2] == 1:
-                    rgba_array[y, x, 3] = 249  # G and B
-                elif marker_array[y, x, 0] == 1 and marker_array[y, x, 1] == 1 and marker_array[y, x, 2] == 1:
-                    rgba_array[y, x, 3] = 248  # All three channels
+                img_array[y, x] = [r_mod, g_mod, b_mod, alpha]
     
     # Convert numpy array to PIL Image with alpha channel
-    return Image.fromarray(rgba_array, 'RGBA')
+    return Image.fromarray(img_array, 'RGBA')
 
 def image_to_shares(image, num_shares, threshold, progress_callback=None):
     """
@@ -105,8 +73,8 @@ def image_to_shares(image, num_shares, threshold, progress_callback=None):
     for y in range(height):
         for x in range(width):
             # Get pixel values
-            if len(img_array.shape) == 3 and img_array.shape[2] == 3:  # RGB image
-                r, g, b = img_array[y, x]
+            if len(img_array.shape) == 3 and img_array.shape[2] >= 3:  # RGB or RGBA image
+                r, g, b = img_array[y, x][:3]  # Get first 3 channels (RGB)
                 
                 # Split each color channel
                 r_shares = split_secret(int(r), threshold, num_shares)
@@ -131,7 +99,7 @@ def image_to_shares(image, num_shares, threshold, progress_callback=None):
             
             # Update progress
             processed_pixels += 1
-            if progress_callback and processed_pixels % 100 == 0:
+            if progress_callback and processed_pixels % 500 == 0:  # Reduced frequency of updates
                 progress_callback(processed_pixels / total_pixels)
     
     # Create preview images for each share
@@ -181,26 +149,20 @@ def shares_to_image(shares, progress_callback=None):
                     if img_array.shape[2] == 4:
                         alpha = img_array[y, x, 3]
                         
-                        # Decode our special alpha values to restore 256 values
-                        if alpha == 255:  # R channel was 256
-                            r = 256 if r == 255 else r
-                        elif alpha == 253:  # G channel was 256
-                            g = 256 if g == 255 else g
-                        elif alpha == 252:  # B channel was 256
-                            b = 256 if b == 255 else b
-                        elif alpha == 251:  # R and G were 256
-                            r = 256 if r == 255 else r
-                            g = 256 if g == 255 else g
-                        elif alpha == 250:  # R and B were 256
-                            r = 256 if r == 255 else r
-                            b = 256 if b == 255 else b
-                        elif alpha == 249:  # G and B were 256
-                            g = 256 if g == 255 else g
-                            b = 256 if b == 255 else b
-                        elif alpha == 248:  # All three were 256
-                            r = 256 if r == 255 else r
-                            g = 256 if g == 255 else g
-                            b = 256 if b == 255 else b
+                        # Check bits in alpha to detect 256 values
+                        # Alpha values below 255 indicate 256 values in specific channels
+                        if alpha < 255:
+                            # Check if R channel had 256 (bit 0 is set)
+                            if (255 - alpha) & 1:
+                                r = 256 if r == 0 else r
+                            
+                            # Check if G channel had 256 (bit 1 is set)
+                            if (255 - alpha) & 2:
+                                g = 256 if g == 0 else g
+                                
+                            # Check if B channel had 256 (bit 2 is set)
+                            if (255 - alpha) & 4:
+                                b = 256 if b == 0 else b
                     
                     pixels.append((r, g, b))
                 else:  # Grayscale image
@@ -251,7 +213,7 @@ def shares_to_image(shares, progress_callback=None):
             
             # Update progress
             processed_pixels += 1
-            if progress_callback and processed_pixels % 100 == 0:
+            if progress_callback and processed_pixels % 500 == 0:  # Reduced frequency of updates
                 progress_callback(processed_pixels / total_pixels)
     
     # Final progress update
