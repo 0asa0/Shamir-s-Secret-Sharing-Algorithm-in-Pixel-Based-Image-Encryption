@@ -15,20 +15,65 @@ def create_preview_image(share_data, original_shape):
     # Create an empty image with the same shape as the original
     img_array = np.zeros(original_shape, dtype=np.uint8)
     
+    # We'll create a separate array to mark which pixels had values of 256
+    # This helps us distinguish between original 0 and values that were 256
+    marker_array = np.zeros((original_shape[0], original_shape[1], 3), dtype=np.uint8)
+    
     # Fill the image with share data
     for y in range(original_shape[0]):
         for x in range(original_shape[1]):
             pixel_idx = y * original_shape[1] + x
             if pixel_idx < len(share_data):
                 r, g, b = share_data[pixel_idx]
-                # Ensure values are within 0-255 range
-                r = min(255, r % 256)
-                g = min(255, g % 256)
-                b = min(255, b % 256)
-                img_array[y, x] = [r, g, b]
+                
+                # Check for values that are exactly 256 (would become 0 in the PNG)
+                # We'll use a special encoding: 255 in the main image and 1 in the marker
+                r_is_256 = 1 if r == 256 else 0
+                g_is_256 = 1 if g == 256 else 0
+                b_is_256 = 1 if b == 256 else 0
+                
+                # Store markers for any 256 values
+                marker_array[y, x] = [r_is_256, g_is_256, b_is_256]
+                
+                # Convert 256 to 255 in the main image
+                r_val = 255 if r == 256 else r % 256
+                g_val = 255 if g == 256 else g % 256
+                b_val = 255 if b == 256 else b % 256
+                
+                img_array[y, x] = [r_val, g_val, b_val]
     
-    # Convert numpy array to PIL Image
-    return Image.fromarray(img_array)
+    # Combine the arrays: we'll use the alpha channel for our marker
+    # Convert RGB to RGBA
+    rgba_array = np.zeros((original_shape[0], original_shape[1], 4), dtype=np.uint8)
+    rgba_array[:, :, :3] = img_array  # Copy RGB channels
+    
+    # Use the alpha channel as our marker: 254 means normal, 255 means there was a 256
+    # This gives us a way to detect which pixels were originally 256
+    rgba_array[:, :, 3] = 254  # Default alpha
+    
+    # Set special alpha values for pixels that had 256 in any channel
+    for y in range(original_shape[0]):
+        for x in range(original_shape[1]):
+            if np.any(marker_array[y, x] > 0):
+                # Encode the marker in the alpha channel
+                # We use 255, 253, 252 to indicate which channel(s) had 256
+                if marker_array[y, x, 0] == 1 and marker_array[y, x, 1] == 0 and marker_array[y, x, 2] == 0:
+                    rgba_array[y, x, 3] = 255  # R only
+                elif marker_array[y, x, 0] == 0 and marker_array[y, x, 1] == 1 and marker_array[y, x, 2] == 0:
+                    rgba_array[y, x, 3] = 253  # G only
+                elif marker_array[y, x, 0] == 0 and marker_array[y, x, 1] == 0 and marker_array[y, x, 2] == 1:
+                    rgba_array[y, x, 3] = 252  # B only
+                elif marker_array[y, x, 0] == 1 and marker_array[y, x, 1] == 1 and marker_array[y, x, 0] == 0:
+                    rgba_array[y, x, 3] = 251  # R and G
+                elif marker_array[y, x, 0] == 1 and marker_array[y, x, 1] == 0 and marker_array[y, x, 2] == 1:
+                    rgba_array[y, x, 3] = 250  # R and B
+                elif marker_array[y, x, 0] == 0 and marker_array[y, x, 1] == 1 and marker_array[y, x, 2] == 1:
+                    rgba_array[y, x, 3] = 249  # G and B
+                elif marker_array[y, x, 0] == 1 and marker_array[y, x, 1] == 1 and marker_array[y, x, 2] == 1:
+                    rgba_array[y, x, 3] = 248  # All three channels
+    
+    # Convert numpy array to PIL Image with alpha channel
+    return Image.fromarray(rgba_array, 'RGBA')
 
 def image_to_shares(image, num_shares, threshold, progress_callback=None):
     """
@@ -129,8 +174,34 @@ def shares_to_image(shares, progress_callback=None):
         pixels = []
         for y in range(height):
             for x in range(width):
-                if len(img_array.shape) == 3 and img_array.shape[2] == 3:  # RGB image
-                    r, g, b = img_array[y, x]
+                if len(img_array.shape) >= 3:  # RGB or RGBA image
+                    r, g, b = img_array[y, x][:3]  # Get RGB values
+                    
+                    # Check if this image has an alpha channel (our marker channel)
+                    if img_array.shape[2] == 4:
+                        alpha = img_array[y, x, 3]
+                        
+                        # Decode our special alpha values to restore 256 values
+                        if alpha == 255:  # R channel was 256
+                            r = 256 if r == 255 else r
+                        elif alpha == 253:  # G channel was 256
+                            g = 256 if g == 255 else g
+                        elif alpha == 252:  # B channel was 256
+                            b = 256 if b == 255 else b
+                        elif alpha == 251:  # R and G were 256
+                            r = 256 if r == 255 else r
+                            g = 256 if g == 255 else g
+                        elif alpha == 250:  # R and B were 256
+                            r = 256 if r == 255 else r
+                            b = 256 if b == 255 else b
+                        elif alpha == 249:  # G and B were 256
+                            g = 256 if g == 255 else g
+                            b = 256 if b == 255 else b
+                        elif alpha == 248:  # All three were 256
+                            r = 256 if r == 255 else r
+                            g = 256 if g == 255 else g
+                            b = 256 if b == 255 else b
+                    
                     pixels.append((r, g, b))
                 else:  # Grayscale image
                     value = img_array[y, x]
@@ -168,7 +239,7 @@ def shares_to_image(shares, progress_callback=None):
                 g = recover_secret(g_shares)
                 b = recover_secret(b_shares)
                 
-                # Ensure values are within 0-255 range
+                # Ensure values are within 0-255 range for final image
                 r = min(255, r % 256)
                 g = min(255, g % 256)
                 b = min(255, b % 256)
